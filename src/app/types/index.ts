@@ -16,7 +16,7 @@ export interface TelegramButton {
   
   export interface TelegramAPIResponse {
     ok: boolean;
-    result?: any;
+    result?: unknown;
     description?: string;
     error_code?: number;
   }
