@@ -1,4 +1,3 @@
-// app/api/broadcast/types.ts
 import type { 
     TelegramButton, 
     BroadcastRequest, 
@@ -29,5 +28,4 @@ import type {
     error?: string;
   };
   
-  // Change this line to use export type
   export type { TelegramButton, BroadcastRequest, BroadcastResponse, TelegramAPIResponse };

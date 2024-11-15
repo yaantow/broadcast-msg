@@ -1,4 +1,3 @@
-// app/types/index.ts
 export interface TelegramButton {
     text: string;
     url: string;

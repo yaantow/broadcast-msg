@@ -1,4 +1,3 @@
-// app/page.tsx
 'use client';
 import { useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -7,6 +6,8 @@ import { Textarea } from "@/components/ui/textarea"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Input } from "@/components/ui/input"
+import { ThemeToggle } from "@/components/theme-toggle"
+
 
 interface TelegramButton {
   text: string;
@@ -163,10 +164,13 @@ export default function BroadcastPage() {
 
   return (
 <div className="min-h-screen bg-background">
+  
   <div className="container mx-auto p-4">
+  <ThemeToggle />
     <Card className="bg-card text-card-foreground">
         <CardHeader>
           <CardTitle>Telegram Broadcast</CardTitle>
+          
         </CardHeader>
         <CardContent>
           <div className="space-y-4">
