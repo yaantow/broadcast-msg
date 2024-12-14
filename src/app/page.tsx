@@ -1,13 +1,14 @@
 'use client';
-import { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Input } from "@/components/ui/input"
 import { ThemeToggle } from "@/components/theme-toggle"
-
+import { Progress } from "@/components/ui/progress"
+import { Loader2, CheckCircle, XCircle, AlertCircle } from "lucide-react"
 
 interface TelegramButton {
   text: string;
@@ -18,17 +19,59 @@ interface TelegramUser {
   uid: string;
 }
 
+interface BroadcastProgress {
+  successful: number;
+  failed: number;
+  totalProcessed: number;
+  totalUsers: number;
+  failedIds: string[];
+  processedBatches: number;
+  totalBatches: number;
+}
+
+interface ErrorCategory {
+  errorMessage: string;  // The actual error message
+  userIds: string[];    // List of users with this error
+}
+
+const categorizeErrors = (failedIds: string[]): ErrorCategory[] => {
+  const errorGroups = new Map<string, string[]>();
+  
+  failedIds.forEach(failure => {
+    // Split the failure string into userId and error message
+    const [userId, ...errorParts] = failure.split(': ');
+    const errorMessage = errorParts.join(': '); // Rejoin in case error message contained colons
+    
+    if (!errorGroups.has(errorMessage)) {
+      errorGroups.set(errorMessage, []);
+    }
+    errorGroups.get(errorMessage)?.push(userId);
+  });
+
+  return Array.from(errorGroups.entries()).map(([errorMessage, userIds]) => ({
+    errorMessage,
+    userIds
+  }));
+};
+
+
 export default function BroadcastPage() {
   const [users, setUsers] = useState<TelegramUser[]>([]);
   const [manualUserIds, setManualUserIds] = useState('');
   const [status, setStatus] = useState<string>('');
   const [isLoading, setIsLoading] = useState(false);
+  const [progress, setProgress] = useState<BroadcastProgress | null>(null);
   
   // Rich message state
   const [messageText, setMessageText] = useState('');
   const [imageUrl, setImageUrl] = useState('');
   const [buttons, setButtons] = useState<TelegramButton[]>([]);
   const [newButton, setNewButton] = useState<TelegramButton>({ text: '', url: '' });
+  const [failedUsers, setFailedUsers] = useState<string[]>([]);
+
+  // Error handing
+  const [errorCategories, setErrorCategories] = useState<ErrorCategory[]>([]);
+
 
   const addButton = () => {
     if (buttons.length >= 3) {
@@ -101,84 +144,168 @@ export default function BroadcastPage() {
     setStatus(`Added ${userIdList.length} users manually`);
   };
 
-  const handleBroadcast = async () => {
-    if (!messageText.trim() || users.length === 0) {
+  const handleBroadcast = async (retryCategory?: ErrorCategory | false) => {
+    if (!messageText.trim() || (users.length === 0 && !retryCategory)) {
       setStatus('Please provide a message and add users');
       return;
     }
-
+  
     setIsLoading(true);
+    setProgress(null);
     setStatus('Broadcasting messages...');
-
+  
     try {
+      const targetUsers = retryCategory ? retryCategory.userIds : users.map(user => user.uid);
+  
       const response = await fetch('/api/broadcast', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Accept': 'text/event-stream',
         },
         body: JSON.stringify({
           message: messageText,
           imageUrl,
           buttons,
-          users: users.map(user => user.uid),
+          users: targetUsers,
         }),
       });
-
-      const responseData = await response.json();
-      console.log('Broadcast Response:', responseData);
-
+  
       if (!response.ok) {
-        throw new Error(responseData.error || 'Broadcast failed');
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
       
-      // Update status message with success and failure counts
-      const statusMessage = responseData.message;
-      setStatus(statusMessage);
-
-      // Only clear form if there were successful sends
-      if (responseData.details.successful > 0) {
+      const reader = response.body?.getReader();
+      if (reader) {
+        try {
+          let lastEventTime = Date.now();
+          const TIMEOUT = 10000; // 10 seconds timeout
+  
+          while (true) {
+            const { done, value } = await reader.read();
+            
+            if (done) {
+              console.log("Stream complete");
+              break;
+            }
+  
+            // Update last event time
+            lastEventTime = Date.now();
+            
+            const text = new TextDecoder().decode(value);
+            const events = text.split('\n\n');
+            
+            for (const event of events) {
+              if (event.startsWith('data: ')) {
+                const data = JSON.parse(event.slice(6)) as BroadcastProgress;
+                setProgress(data);
+                
+                const percentComplete = Math.round((data.totalProcessed / data.totalUsers) * 100);
+                setStatus(`Progress: ${percentComplete}% (${data.totalProcessed}/${data.totalUsers})`);
+                
+                if (data.failedIds.length > 0) {
+                  setFailedUsers(data.failedIds);
+                  setErrorCategories(categorizeErrors(data.failedIds));
+                }
+  
+                // If we've processed all users, break the loop
+                if (data.totalProcessed === data.totalUsers) {
+                  console.log("All users processed");
+                  return;
+                }
+              }
+            }
+  
+            // Check for timeout
+            if (Date.now() - lastEventTime > TIMEOUT) {
+              console.log("Stream timeout");
+              throw new Error('Stream timeout - no updates received for 10 seconds');
+            }
+          }
+        } catch (error) {
+          console.error("Stream reading error:", error);
+          throw error;
+        } finally {
+          reader.releaseLock();
+        }
+      }
+  
+      if (!failedUsers.length) {
         setMessageText('');
         setImageUrl('');
         setButtons([]);
       }
-
-      // If there are failures, show them in a more detailed way
-      if (responseData.details.failed > 0) {
-        console.log('Failed sends:', responseData.details.failedIds);
-        setStatus(prev => `${prev}\n\nFailed IDs: ${responseData.details.failedIds.join(', ')}`);
-      }
-
+  
     } catch (error) {
       console.error('Broadcast error:', error);
       setStatus(error instanceof Error ? error.message : 'Failed to broadcast message. Please try again.');
     } finally {
+      // Always ensure loading state is reset
       setIsLoading(false);
+      console.log("Broadcast complete - loading state reset");
     }
   };
-
+  
   const clearUsers = () => {
     setUsers([]);
     setManualUserIds('');
+    setFailedUsers([]);
     setStatus('User list cleared');
+    setProgress(null);
   };
 
   return (
-<div className="min-h-screen bg-background">
-  
-  <div className="container mx-auto p-4">
-  <ThemeToggle />
-    <Card className="bg-card text-card-foreground">
-        <CardHeader>
-          <CardTitle>Telegram Broadcast</CardTitle>
-          
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            <Tabs defaultValue="manual" className="w-full">
-              <TabsList className="grid w-full grid-cols-2">
-                <TabsTrigger value="manual">Manual Input</TabsTrigger>
-                <TabsTrigger value="csv">CSV Upload</TabsTrigger>
-              </TabsList>
+    <div className="min-h-screen bg-background">
+      <div className="container mx-auto p-4">
+        <ThemeToggle />
+        <Card>
+          <CardHeader>
+            <CardTitle>Telegram Broadcast</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {/* Progress Section */}
+            {progress && (
+              <div className="mb-6 space-y-2">
+                <div className="flex items-center justify-between text-sm">
+                  <span>Progress</span>
+                  <span>{Math.round((progress.totalProcessed / progress.totalUsers) * 100)}%</span>
+                </div>
+                <Progress 
+                  value={(progress.totalProcessed / progress.totalUsers) * 100} 
+                />
+                <div className="grid grid-cols-2 gap-4 text-sm">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle className="text-green-500 h-4 w-4" />
+                    <span>Successful: {progress.successful}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <XCircle className="text-red-500 h-4 w-4" />
+                    <span>Failed: {progress.failed}</span>
+                  </div>
+                </div>
+                {progress.failed > 0 && (
+                  <Alert variant="destructive">
+                    <AlertCircle className="h-4 w-4" />
+                    <AlertTitle>Failed Deliveries</AlertTitle>
+                    <AlertDescription>
+                      <div className="mt-2 max-h-32 overflow-y-auto text-sm">
+                        {progress.failedIds.map((id, index) => (
+                          <div key={index} className="py-1">{id}</div>
+                        ))}
+                      </div>
+                    </AlertDescription>
+                  </Alert>
+                )}
+              </div>
+            )}
+
+            {/* Existing form content */}
+            <div className="space-y-4">
+              <Tabs defaultValue="manual" className="w-full">
+                <TabsList className="grid w-full grid-cols-2">
+                  <TabsTrigger value="manual">Manual Input</TabsTrigger>
+                  <TabsTrigger value="csv">CSV Upload</TabsTrigger>
+                </TabsList>
               
               <TabsContent value="manual">
                 <div className="space-y-4">
@@ -336,34 +463,73 @@ export default function BroadcastPage() {
               </div>
             </div>
 
-            <Button
-              onClick={handleBroadcast}
-              disabled={isLoading || !messageText.trim() || users.length === 0}
-              className="w-full"
-            >
-              {isLoading ? 'Broadcasting...' : 'Send Broadcast'}
-            </Button>
+            <div className="space-y-2">
+                <Button
+                  onClick={() => handleBroadcast(false)}
+                  disabled={isLoading || !messageText.trim() || users.length === 0}
+                  className="w-full"
+                >
+                  {isLoading ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Broadcasting...
+                    </>
+                  ) : (
+                    'Send Broadcast'
+                  )}
+                </Button>
+                {errorCategories.length > 0 && (
+                  <div className="space-y-4 mt-4">
+                    <div className="text-sm font-medium">Failed Messages by Error Type:</div>
+                    {errorCategories.map((category, index) => (
+                      <div key={index} className="space-y-2">
+                        <div className="flex items-center justify-between">
+                          <div className="text-sm font-medium">
+                            {category.userIds.length} {category.userIds.length === 1 ? 'user' : 'users'}
+                          </div>
+                          <Button
+                            onClick={() => handleBroadcast(category)}
+                            variant="outline"
+                            size="sm"
+                            disabled={isLoading}
+                          >
+                            Retry ({category.userIds.length})
+                          </Button>
+                        </div>
+                        <Alert variant="destructive">
+                          <AlertCircle className="h-4 w-4" />
+                          <AlertTitle>Error Type</AlertTitle>
+                          <AlertDescription>
+                            <p className="mb-2">{category.errorMessage}</p>
+                            <div className="mt-2 max-h-24 overflow-y-auto text-sm">
+                              <div className="font-medium mb-1">Affected Users:</div>
+                              {category.userIds.map((userId, idx) => (
+                                <div key={idx} className="py-1">{userId}</div>
+                              ))}
+                            </div>
+                          </AlertDescription>
+                        </Alert>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
 
-            {status && (
-              <Alert className={`whitespace-pre-wrap ${
-                status.includes('Failed') ? 'bg-red-50' : 
-                status.includes('Successfully') ? 'bg-green-50' : ''
-              }`}>
-                <AlertDescription>
-                  {status.split('\n').map((line, index) => (
-                    <div key={index} className={
-                      line.includes('Failed IDs:') ? 'text-red-600 mt-2' : ''
-                    }>
-                      {line}
-                    </div>
-                  ))}
-                </AlertDescription>
-              </Alert>
-            )}
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+              {/* Status Messages */}
+              {status && (
+                <Alert className={`whitespace-pre-wrap ${
+                  status.includes('Failed') ? 'bg-red-50' : 
+                  status.includes('Successfully') ? 'bg-green-50' : ''
+                }`}>
+                  <AlertDescription>
+                    {status}
+                  </AlertDescription>
+                </Alert>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
